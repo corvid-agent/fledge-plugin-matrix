@@ -199,14 +199,18 @@ cmd_run() {
             local v="${pair#*=}"
             local upper_k
             upper_k=$(echo "$k" | tr '[:lower:]' '[:upper:]')
-            env_exports="${env_exports}export MATRIX_${upper_k}='${v}'; "
+            export "MATRIX_${upper_k}=${v}"
             expanded_cmd=$(echo "$expanded_cmd" | sed "s/{${k}}/${v}/g")
         done
 
         echo "[$combo_num/$total] $combo"
 
+        local statusfile="$RESULTS_DIR/${label}.status"
         (
-            eval "${env_exports} ${expanded_cmd}" > "$logfile" 2>&1
+            local rc=0
+            eval "${expanded_cmd}" > "$logfile" 2>&1 || rc=$?
+            echo "$rc" > "$statusfile"
+            exit $rc
         ) &
         pids+=($!)
         labels+=("$combo")
@@ -228,7 +232,7 @@ cmd_run() {
                     echo "FAIL: $lbl (fail-fast enabled, stopping)"
                     if [[ ${#pids[@]} -gt 0 ]]; then
                         for p in "${pids[@]}"; do
-                            kill "$p" 2>/dev/null || true
+                            kill -- -"$p" 2>/dev/null || kill "$p" 2>/dev/null || true
                         done
                     fi
                     echo ""
@@ -249,7 +253,7 @@ cmd_run() {
                     echo ""
                     echo "FAIL: ${labels[$i]} (fail-fast enabled, stopping)"
                     for (( j=i+1; j<${#pids[@]}; j++ )); do
-                        kill "${pids[$j]}" 2>/dev/null || true
+                        kill -- -"${pids[$j]}" 2>/dev/null || kill "${pids[$j]}" 2>/dev/null || true
                     done
                     echo ""
                     echo "Results: $passed passed, $failed failed (aborted)"
@@ -325,12 +329,15 @@ cmd_status() {
         local size
         size=$(wc -c < "$logfile" | tr -d ' ')
 
-        if grep -qi "error\|fail\|panic" "$logfile" 2>/dev/null; then
-            echo "  FAIL  $name ($size bytes)"
+        local status_file="$RESULTS_DIR/$name.status"
+        if [[ -f "$status_file" ]] && [[ "$(cat "$status_file")" != "0" ]]; then
+            echo "  FAIL  $name (exit code $(cat "$status_file"), $size bytes)"
             fail=$((fail + 1))
-        else
+        elif [[ -f "$status_file" ]]; then
             echo "  PASS  $name ($size bytes)"
             pass=$((pass + 1))
+        else
+            echo "  ????  $name ($size bytes, no status recorded)"
         fi
     done
 
