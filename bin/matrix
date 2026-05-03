@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PLUGIN_DIR="${FLEDGE_PLUGIN_DIR:?FLEDGE_PLUGIN_DIR not set — fledge >= 0.15.3 sets it automatically}"
+
+usage() {
+    cat <<'EOF'
+fledge matrix — run a command across multiple configurations
+
+USAGE:
+    fledge matrix <command> [options]
+
+COMMANDS:
+    run <cmd> --over <key>=<val1,val2,...> [--over <key>=<val2,...>]
+                        Run cmd with each combination of variables
+    show                Show what combinations would run (dry run)
+    status              Show results of last matrix run
+
+OPTIONS:
+    --parallel <n>      Max parallel jobs (default: 4)
+    --fail-fast         Stop on first failure
+    --output <dir>      Directory for logs (default: .matrix-results)
+
+VARIABLE EXPANSION:
+    Variables are exported as MATRIX_<KEY> for each run.
+    The command string supports {key} interpolation.
+
+EXAMPLES:
+    fledge matrix run "cargo test" --over toolchain=stable,nightly
+    fledge matrix run "python -m pytest" --over python=3.10,3.11,3.12
+    fledge matrix run "npm test" --over node=18,20,22 --over os=linux,darwin
+    fledge matrix run "./test.sh {db}" --over db=postgres,sqlite --parallel 2
+    fledge matrix show --over env=dev,staging,prod --over region=us,eu
+EOF
+}
+
+RESULTS_DIR="${FLEDGE_MATRIX_OUTPUT:-.matrix-results}"
+MAX_PARALLEL=4
+FAIL_FAST=false
+
+parse_over_flags() {
+    local -a overs=()
+    local cmd=""
+    local parsing_cmd=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --over)
+                parsing_cmd=false
+                overs+=("$2")
+                shift 2
+                ;;
+            --parallel)
+                MAX_PARALLEL="$2"
+                shift 2
+                ;;
+            --fail-fast)
+                FAIL_FAST=true
+                shift
+                ;;
+            --output)
+                RESULTS_DIR="$2"
+                shift 2
+                ;;
+            *)
+                if $parsing_cmd; then
+                    if [[ -z "$cmd" ]]; then
+                        cmd="$1"
+                    else
+                        cmd="$cmd $1"
+                    fi
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    echo "$cmd"
+    for o in "${overs[@]}"; do
+        echo "OVER:$o"
+    done
+}
+
+generate_combinations() {
+    local -a overs=("$@")
+
+    if [[ ${#overs[@]} -eq 0 ]]; then
+        echo ""
+        return
+    fi
+
+    local first="${overs[0]}"
+    local key="${first%%=*}"
+    local vals="${first#*=}"
+
+    local -a remaining=()
+    local i
+    for (( i=1; i<${#overs[@]}; i++ )); do
+        remaining+=("${overs[$i]}")
+    done
+
+    local IFS=','
+    local -a values
+    read -ra values <<< "$vals"
+    unset IFS
+
+    if [[ ${#remaining[@]} -eq 0 ]]; then
+        for v in "${values[@]}"; do
+            echo "$key=$v"
+        done
+    else
+        local sub_combos
+        sub_combos=$(generate_combinations "${remaining[@]}")
+        for v in "${values[@]}"; do
+            while IFS= read -r combo; do
+                echo "$key=$v $combo"
+            done <<< "$sub_combos"
+        done
+    fi
+}
+
+cmd_run() {
+    local cmd=""
+    local -a overs=()
+    local parsing_cmd=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --over)
+                parsing_cmd=false
+                overs+=("$2")
+                shift 2
+                ;;
+            --parallel)
+                MAX_PARALLEL="$2"
+                shift 2
+                ;;
+            --fail-fast)
+                FAIL_FAST=true
+                shift
+                ;;
+            --output)
+                RESULTS_DIR="$2"
+                shift 2
+                ;;
+            *)
+                if $parsing_cmd; then
+                    if [[ -z "$cmd" ]]; then
+                        cmd="$1"
+                    else
+                        cmd="$cmd $1"
+                    fi
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$cmd" ]]; then
+        echo "Error: no command specified"
+        usage
+        exit 1
+    fi
+
+    if [[ ${#overs[@]} -eq 0 ]]; then
+        echo "Error: no --over flags specified"
+        usage
+        exit 1
+    fi
+
+    local combos
+    combos=$(generate_combinations "${overs[@]}")
+
+    local total
+    total=$(echo "$combos" | wc -l | tr -d ' ')
+
+    mkdir -p "$RESULTS_DIR"
+
+    echo "Matrix: $total combinations, max $MAX_PARALLEL parallel"
+    echo "Command: $cmd"
+    echo ""
+
+    local -a pids=()
+    local -a labels=()
+    local running=0
+    local combo_num=0
+    local failed=0
+    local passed=0
+
+    while IFS= read -r combo; do
+        combo_num=$((combo_num + 1))
+        local label=$(echo "$combo" | tr ' ' '_')
+        local logfile="$RESULTS_DIR/$label.log"
+
+        local expanded_cmd="$cmd"
+        local env_exports=""
+
+        for pair in $combo; do
+            local k="${pair%%=*}"
+            local v="${pair#*=}"
+            local upper_k
+            upper_k=$(echo "$k" | tr '[:lower:]' '[:upper:]')
+            env_exports="${env_exports}export MATRIX_${upper_k}='${v}'; "
+            expanded_cmd=$(echo "$expanded_cmd" | sed "s/{${k}}/${v}/g")
+        done
+
+        echo "[$combo_num/$total] $combo"
+
+        (
+            eval "${env_exports} ${expanded_cmd}" > "$logfile" 2>&1
+        ) &
+        pids+=($!)
+        labels+=("$combo")
+        running=$((running + 1))
+
+        if [[ $running -ge $MAX_PARALLEL ]]; then
+            local pid="${pids[0]}"
+            local lbl="${labels[0]}"
+            pids=("${pids[@]:1}")
+            labels=("${labels[@]:1}")
+            running=$((running - 1))
+
+            if wait "$pid"; then
+                passed=$((passed + 1))
+            else
+                failed=$((failed + 1))
+                if $FAIL_FAST; then
+                    echo ""
+                    echo "FAIL: $lbl (fail-fast enabled, stopping)"
+                    if [[ ${#pids[@]} -gt 0 ]]; then
+                        for p in "${pids[@]}"; do
+                            kill "$p" 2>/dev/null || true
+                        done
+                    fi
+                    echo ""
+                    echo "Results: $passed passed, $failed failed (aborted)"
+                    exit 1
+                fi
+            fi
+        fi
+    done <<< "$combos"
+
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        for i in "${!pids[@]}"; do
+            if wait "${pids[$i]}"; then
+                passed=$((passed + 1))
+            else
+                failed=$((failed + 1))
+                if $FAIL_FAST; then
+                    echo ""
+                    echo "FAIL: ${labels[$i]} (fail-fast enabled, stopping)"
+                    for (( j=i+1; j<${#pids[@]}; j++ )); do
+                        kill "${pids[$j]}" 2>/dev/null || true
+                    done
+                    echo ""
+                    echo "Results: $passed passed, $failed failed (aborted)"
+                    exit 1
+                fi
+            fi
+        done
+    fi
+
+    echo ""
+    if [[ $failed -gt 0 ]]; then
+        echo "Results: $passed passed, $failed failed"
+        echo "Logs in $RESULTS_DIR/"
+        exit 1
+    else
+        echo "Results: $total/$total passed"
+        exit 0
+    fi
+}
+
+cmd_show() {
+    local parsed
+    parsed=$(parse_over_flags "$@")
+
+    local -a overs=()
+    while IFS= read -r line; do
+        if [[ "$line" == OVER:* ]]; then
+            overs+=("${line#OVER:}")
+        fi
+    done <<< "$parsed"
+
+    if [[ ${#overs[@]} -eq 0 ]]; then
+        echo "Error: no --over flags specified"
+        exit 1
+    fi
+
+    local combos
+    combos=$(generate_combinations "${overs[@]}")
+
+    local total
+    total=$(echo "$combos" | wc -l | tr -d ' ')
+
+    echo "Matrix: $total combinations"
+    echo ""
+
+    local n=0
+    while IFS= read -r combo; do
+        n=$((n + 1))
+        echo "  [$n] $combo"
+    done <<< "$combos"
+}
+
+cmd_status() {
+    if [[ ! -d "$RESULTS_DIR" ]]; then
+        echo "No matrix results found. Run 'fledge matrix run' first."
+        exit 0
+    fi
+
+    echo "Last matrix results ($RESULTS_DIR/):"
+    echo ""
+
+    local total=0
+    local pass=0
+    local fail=0
+
+    for logfile in "$RESULTS_DIR"/*.log; do
+        [[ -f "$logfile" ]] || continue
+        total=$((total + 1))
+        local name
+        name=$(basename "$logfile" .log)
+        local last_line
+        last_line=$(tail -1 "$logfile" 2>/dev/null || echo "")
+        local size
+        size=$(wc -c < "$logfile" | tr -d ' ')
+
+        if grep -qi "error\|fail\|panic" "$logfile" 2>/dev/null; then
+            echo "  FAIL  $name ($size bytes)"
+            fail=$((fail + 1))
+        else
+            echo "  PASS  $name ($size bytes)"
+            pass=$((pass + 1))
+        fi
+    done
+
+    if [[ $total -eq 0 ]]; then
+        echo "  No log files found."
+    else
+        echo ""
+        echo "$pass/$total passed"
+    fi
+}
+
+case "${1:-}" in
+    run)      shift; cmd_run "$@" ;;
+    show)     shift; cmd_show "$@" ;;
+    status)   cmd_status ;;
+    -h|--help|"") usage ;;
+    *)        echo "Unknown command: $1"; usage; exit 1 ;;
+esac

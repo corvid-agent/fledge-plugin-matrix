@@ -1,0 +1,15 @@
+[plugin]
+name = "matrix"
+version = "0.1.0"
+description = "Run a command across multiple configurations in parallel"
+author = "corvid-agent"
+
+[[commands]]
+name = "matrix"
+description = "Fan-out a command across versions, envs, or targets"
+binary = "bin/matrix"
+
+[capabilities]
+exec = false
+store = false
+metadata = false
