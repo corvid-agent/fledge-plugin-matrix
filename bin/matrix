@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 PLUGIN_DIR="${FLEDGE_PLUGIN_DIR:?FLEDGE_PLUGIN_DIR not set — fledge >= 0.15.3 sets it automatically}"
+export PLUGIN_DIR
 
 usage() {
     cat <<'EOF'
@@ -188,19 +189,18 @@ cmd_run() {
 
     while IFS= read -r combo; do
         combo_num=$((combo_num + 1))
-        local label=$(echo "$combo" | tr ' ' '_')
+        local label
+        label=$(echo "$combo" | tr ' ' '_')
         local logfile="$RESULTS_DIR/$label.log"
 
         local expanded_cmd="$cmd"
-        local env_exports=""
-
         for pair in $combo; do
             local k="${pair%%=*}"
             local v="${pair#*=}"
             local upper_k
             upper_k=$(echo "$k" | tr '[:lower:]' '[:upper:]')
             export "MATRIX_${upper_k}=${v}"
-            expanded_cmd=$(echo "$expanded_cmd" | sed "s/{${k}}/${v}/g")
+            expanded_cmd="${expanded_cmd//\{${k}\}/${v}}"
         done
 
         echo "[$combo_num/$total] $combo"
@@ -324,8 +324,6 @@ cmd_status() {
         total=$((total + 1))
         local name
         name=$(basename "$logfile" .log)
-        local last_line
-        last_line=$(tail -1 "$logfile" 2>/dev/null || echo "")
         local size
         size=$(wc -c < "$logfile" | tr -d ' ')
 
