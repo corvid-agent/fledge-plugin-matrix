@@ -1,5 +1,5 @@
 [plugin]
-name = "matrix"
+name = "fledge-plugin-matrix"
 version = "0.1.0"
 description = "Run a command across multiple configurations in parallel"
 author = "corvid-agent"
